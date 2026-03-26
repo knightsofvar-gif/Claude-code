@@ -10,6 +10,8 @@ Backends (--model):
   opus   – Claude Opus 4.6  (~$0.08/run, best AI explanations)
   haiku  – Claude Haiku 4.5 (~$0.01/run, 5× cheaper, still good quality)
   free   – Semantic Scholar API (completely free, no API key, real citation data)
+  both   – Semantic Scholar + Claude Haiku concurrently, results merged/deduped
+           (~$0.01/run — SS is free, only Haiku's share costs anything)
 
 Other features:
   - Both queries run concurrently (ThreadPoolExecutor)
@@ -354,6 +356,89 @@ def fetch_recent_claude(topic: str, n: int, days: int, model_key: str) -> list[R
     return _validate(_extract_json(response, "recent"), RecentPaper)
 
 
+# ─── Merge / deduplication helpers (for --model both) ────────────────────────
+
+_STRIP_PUNCT = re.compile(r"[^\w\s]")
+
+
+def _norm_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — for fuzzy dedup."""
+    return _STRIP_PUNCT.sub("", title.lower()).split()
+
+
+def _titles_match(a: str, b: str) -> bool:
+    """True when two titles share ≥80 % of their words after normalisation."""
+    wa, wb = set(_norm_title(a)), set(_norm_title(b))
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / max(len(wa), len(wb)) >= 0.8
+
+
+def _merge_foundational(
+    ss: list[FoundationalPaper], cl: list[FoundationalPaper], n: int
+) -> list[FoundationalPaper]:
+    """
+    Merge two foundational lists. For duplicates keep the SS entry (real DOI /
+    citation count) but upgrade the `why` field with Haiku's explanation when
+    it is more informative than "Cited N times."
+    """
+    merged: list[FoundationalPaper] = list(ss)
+    ss_titles = [p.title for p in ss]
+
+    for cp in cl:
+        # Check whether this Claude paper already appears in the SS list
+        match_idx = next(
+            (i for i, t in enumerate(ss_titles) if _titles_match(t, cp.title)),
+            None,
+        )
+        if match_idx is not None:
+            # Upgrade `why` if Haiku's version is richer
+            sp = merged[match_idx]
+            if len(cp.why) > len(sp.why):
+                merged[match_idx] = sp.model_copy(update={"why": cp.why})
+        else:
+            merged.append(cp)
+
+    # Sort: SS papers (have citation counts in why) first by citation mention;
+    # append Claude-only papers at the end.  Trim to n.
+    def _sort_key(p: FoundationalPaper) -> int:
+        m = re.search(r"([\d,]+)\s+times", p.why)
+        return int(m.group(1).replace(",", "")) if m else 0
+
+    merged.sort(key=_sort_key, reverse=True)
+    return merged[:n]
+
+
+def _merge_recent(
+    ss: list[RecentPaper], cl: list[RecentPaper], n: int
+) -> list[RecentPaper]:
+    """
+    Merge two recent lists. For duplicates keep SS entry (real DOI / date) but
+    upgrade `abstract` with Haiku's version when it is more informative.
+    """
+    merged: list[RecentPaper] = list(ss)
+    ss_titles = [p.title for p in ss]
+
+    for cp in cl:
+        match_idx = next(
+            (i for i, t in enumerate(ss_titles) if _titles_match(t, cp.title)),
+            None,
+        )
+        if match_idx is not None:
+            sp = merged[match_idx]
+            if len(cp.abstract) > len(sp.abstract):
+                merged[match_idx] = sp.model_copy(update={"abstract": cp.abstract})
+        else:
+            merged.append(cp)
+
+    # Sort by publication date descending, trim to n
+    def _pub_sort(p: RecentPaper) -> str:
+        return (p.published or "0000-00-00")[:10]
+
+    merged.sort(key=_pub_sort, reverse=True)
+    return merged[:n]
+
+
 # ─── Orchestration (cache + concurrency) ──────────────────────────────────────
 
 def get_foundational_papers(
@@ -364,10 +449,17 @@ def get_foundational_papers(
         hit = cache_load(key, FOUNDATIONAL_TTL_DAYS)
         if hit is not None:
             return _validate(hit, FoundationalPaper)
-    if model_key == "free":
+
+    if model_key == "both":
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ss_fut = pool.submit(fetch_foundational_free, topic, n)
+            cl_fut = pool.submit(fetch_foundational_claude, topic, n, "haiku")
+        papers = _merge_foundational(ss_fut.result(), cl_fut.result(), n)
+    elif model_key == "free":
         papers = fetch_foundational_free(topic, n)
     else:
         papers = fetch_foundational_claude(topic, n, model_key)
+
     cache_save(key, [p.model_dump() for p in papers])
     return papers
 
@@ -380,10 +472,17 @@ def get_recent_papers(
         hit = cache_load(key, RECENT_TTL_DAYS)
         if hit is not None:
             return _validate(hit, RecentPaper)
-    if model_key == "free":
+
+    if model_key == "both":
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ss_fut = pool.submit(fetch_recent_free, topic, n, days)
+            cl_fut = pool.submit(fetch_recent_claude, topic, n, days, "haiku")
+        papers = _merge_recent(ss_fut.result(), cl_fut.result(), n)
+    elif model_key == "free":
         papers = fetch_recent_free(topic, n, days)
     else:
         papers = fetch_recent_claude(topic, n, days, model_key)
+
     cache_save(key, [p.model_dump() for p in papers])
     return papers
 
@@ -487,14 +586,18 @@ def main() -> None:
                              Uses real citation counts for foundational papers.
               --model haiku  Claude Haiku 4.5 — ~$0.01/run, AI explanations included.
               --model opus   Claude Opus 4.6  — ~$0.08/run, best quality (default).
+              --model both   Semantic Scholar + Haiku run concurrently; results are
+                             merged and deduplicated. Best balance of cost and quality.
+                             SS supplies real citation counts / DOIs; Haiku enriches
+                             the `why` / abstract fields. Cost: ~$0.01/run.
 
             Examples:
               python paper_recommender.py "bioadsorption of rare earth elements" --model free
-              python paper_recommender.py "graph neural networks" -f 10 -r 15 --model haiku
+              python paper_recommender.py "graph neural networks" -f 10 -r 15 --model both
               python paper_recommender.py "diffusion models" --days 180
 
-              # Free mode + institutional access:
-              python paper_recommender.py "rare earth bioadsorption" --model free \\
+              # Best-of-both + institutional access:
+              python paper_recommender.py "rare earth bioadsorption" --model both \\
                 --email you@university.edu \\
                 --proxy "https://proxy.myuniversity.edu/login?url="
         """),
@@ -506,8 +609,8 @@ def main() -> None:
                         help="Number of recent papers (default: 10)")
     parser.add_argument("--days", "-d", type=int, default=365, metavar="DAYS",
                         help="Days back to search for recent papers (default: 365)")
-    parser.add_argument("--model", "-m", choices=["free", "haiku", "opus"], default="opus",
-                        help="Backend to use: free / haiku / opus (default: opus)")
+    parser.add_argument("--model", "-m", choices=["free", "haiku", "opus", "both"], default="opus",
+                        help="Backend to use: free / haiku / opus / both (default: opus)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Ignore cache and always fetch fresh results")
     parser.add_argument("--email", metavar="EMAIL",
@@ -517,7 +620,12 @@ def main() -> None:
     args = parser.parse_args()
 
     topic = args.topic.strip()
-    costs = {"free": "$0.00 (Semantic Scholar)", "haiku": "~$0.01", "opus": "~$0.08"}
+    costs = {
+        "free":  "$0.00 (Semantic Scholar)",
+        "haiku": "~$0.01",
+        "opus":  "~$0.08",
+        "both":  "~$0.01 (Haiku) + $0.00 (Semantic Scholar)",
+    }
     print(f"\nSearching paper recommendations for: '{topic}'")
     print(f"  Backend: {args.model}  |  Est. cost: {costs[args.model]}\n")
 
