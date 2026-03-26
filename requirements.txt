@@ -1,2 +1,2 @@
 anthropic
-requests
+pydantic
