@@ -89,6 +89,18 @@ BENCHMARKS = [
             "denoising diffusion",
         ],
     },
+    {
+        "topic": "bioadsorption of rare earth elements",
+        "n_foundational": 6,
+        "n_recent": 5,
+        "days_recent": 365,
+        "expected_titles": [
+            # Volesky's biosorption work is the cornerstone of the field
+            "biosorption",
+            # REE recovery / rare earth is the core application
+            "rare earth",
+        ],
+    },
 ]
 
 
